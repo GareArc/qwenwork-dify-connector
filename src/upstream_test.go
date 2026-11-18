@@ -381,3 +381,24 @@ func TestOfficialHTTPRedirectPolicy(t *testing.T) {
 		t.Fatal("unbounded redirect chain was accepted")
 	}
 }
+
+func TestAdoptVerifiedRestoresAStaleReceipt(t *testing.T) {
+	fixture := previousCachedBinary(t)
+	asset := assetForTest(fixture.body, "")
+	later := time.Now().Add(time.Hour)
+	if err := os.Chtimes(fixture.path, later, later); err != nil {
+		t.Fatal(err)
+	}
+	if receiptValid(fixture.path, asset) {
+		t.Fatal("a changed modification time must invalidate the receipt")
+	}
+	if err := verifyOfficial(fixture.path, asset); err != nil {
+		t.Fatal(err)
+	}
+	if err := adoptVerified(fixture.path, asset); err != nil {
+		t.Fatal(err)
+	}
+	if !receiptValid(fixture.path, asset) {
+		t.Fatal("a re-verified binary did not get a fresh receipt")
+	}
+}

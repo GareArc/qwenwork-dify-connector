@@ -77,39 +77,27 @@ func root() (string, error) {
 	}
 	return absolute, nil
 }
-func bundledBinary() (string, bool, error) {
+
+// The difyctl bundled in an offline package, or the fallback's cached one.
+func resolveBinary(fallback func() (string, error)) (string, error) {
 	if vendorPath != "" {
-		return vendorPath, true, nil
+		return vendorPath, nil
 	}
 	self, err := os.Executable()
 	if err != nil {
-		return "", false, err
+		return "", err
 	}
 	bundled := filepath.Clean(filepath.Join(filepath.Dir(self), "..", "..", "vendor", runtime.GOOS+"_"+runtime.GOARCH, executableName("difyctl")))
 	if info, err := os.Stat(bundled); err == nil && info.Mode().IsRegular() {
-		return bundled, true, nil
+		return bundled, nil
 	}
-	return "", false, nil
+	return fallback()
 }
 func installedBinary() (string, error) {
-	path, bundled, err := bundledBinary()
-	if err != nil {
-		return "", err
-	}
-	if bundled {
-		return path, nil
-	}
-	return installedOfficialCLI()
+	return resolveBinary(installedOfficialCLI)
 }
 func binary(ctx context.Context, progress downloadProgress) (string, error) {
-	path, bundled, err := bundledBinary()
-	if err != nil {
-		return "", err
-	}
-	if bundled {
-		return path, nil
-	}
-	return ensureOfficialCLI(ctx, progress)
+	return resolveBinary(func() (string, error) { return ensureOfficialCLI(ctx, progress) })
 }
 
 // difyctl's config folder: the user's own one when they chose to share its login,
@@ -382,6 +370,22 @@ func token() string {
 	return base64.RawURLEncoding.EncodeToString(raw)
 }
 
+const (
+	stageSetup       = "setup"
+	stageStarting    = "starting"
+	stageDownloading = "downloading"
+	stagePending     = "pending"
+	stageAuthorized  = "authorized"
+	stageError       = "error"
+)
+
+const (
+	bytesPerMB           = 1 << 20
+	msgRequestingDevice  = "正在向 Dify 请求设备授权…"
+	msgDownloadProgress  = "首次连接需要下载官方 difyctl（约 %d MB），已完成 %d%%。请保持本页打开。"
+	msgSharedLoginReused = "已连接，使用本机 difyctl 的登录。"
+)
+
 type portalState struct {
 	sync.Mutex
 	Stage           string            `json:"stage"`
@@ -402,7 +406,7 @@ func (s *portalState) fail(err error) {
 		e = &adapterError{"E-9999", "连接异常，内部详情未输出。"}
 	}
 	s.Lock()
-	s.Stage = "error"
+	s.Stage = stageError
 	s.Message = e.Message
 	s.ErrorCode = e.Code
 	s.Unlock()
@@ -414,7 +418,7 @@ func (s *portalState) set(stage, message string) {
 	s.Unlock()
 }
 func (s *portalState) downloading(done, total int64) {
-	s.set("downloading", fmt.Sprintf("首次连接需要下载官方 difyctl（约 %d MB），已完成 %d%%。请保持本页打开。", total>>20, done*100/total))
+	s.set(stageDownloading, fmt.Sprintf(msgDownloadProgress, total/bytesPerMB, done*100/total))
 }
 func (s *portalState) snapshot() map[string]any {
 	s.Lock()
@@ -424,7 +428,7 @@ func (s *portalState) snapshot() map[string]any {
 }
 func (s *portalState) authorized(identity map[string]string, message string) {
 	s.Lock()
-	s.Stage = "authorized"
+	s.Stage = stageAuthorized
 	s.Message = message
 	s.Identity = identity
 	s.Unlock()
@@ -434,6 +438,54 @@ func asInt(data any, fallback int) int {
 		return int(f)
 	}
 	return fallback
+}
+
+// A shared folder that already holds a login for another server, or a non-HTTPS
+// one, can't be used: reusing it would send every call elsewhere, and a new login
+// would replace the terminal's.
+func sharedLoginConflicts(choice connectorSettings) bool {
+	if choice.SharedConfigDir == "" {
+		return false
+	}
+	saved := readSavedLogin(choice.SharedConfigDir)
+	if saved.Email == "" {
+		return false
+	}
+	return saved.Server != choice.Server
+}
+
+// A working login in the shared folder is reused (/start already refused one for
+// another server); an expired one falls through to a new device login.
+func reuseSharedLogin(ctx context.Context, choice connectorSettings, state *portalState) (bool, error) {
+	if choice.SharedConfigDir == "" {
+		return false, nil
+	}
+	if readSavedLogin(choice.SharedConfigDir).Email == "" {
+		return false, nil
+	}
+	identity, err := account(ctx, false)
+	if hasCode(err, "E-0001") {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if err = clearRequired(); err != nil {
+		return false, err
+	}
+	state.authorized(identity, msgSharedLoginReused)
+	return true, nil
+}
+
+// The private profile keeps its token in a file: difyctl names keychain entries by
+// host and email only, so a keychain token would collide with the terminal
+// difyctl's. A shared folder keeps difyctl's usual storage.
+func loginArgs(choice connectorSettings) []string {
+	args := []string{"login", "--server", choice.Server, "--no-browser", "--no-wait"}
+	if choice.SharedConfigDir == "" {
+		args = append(args, "--no-keyring")
+	}
+	return args
 }
 func runAuthorization(ctx context.Context, choice connectorSettings, state *portalState) {
 	failed := func(e error) {
@@ -454,25 +506,16 @@ func runAuthorization(ctx context.Context, choice connectorSettings, state *port
 		failed(err)
 		return
 	}
-	if choice.SharedConfigDir != "" {
-		// A working login in the shared folder is reused as is; only a missing or
-		// expired one falls through to a new device login.
-		identity, err := account(ctx, false)
-		if err == nil {
-			if err = clearRequired(); err != nil {
-				failed(err)
-				return
-			}
-			state.authorized(identity, "已连接，使用本机 difyctl 的登录。")
-			return
-		}
-		if !hasCode(err, "E-0001") {
-			failed(err)
-			return
-		}
+	reused, err := reuseSharedLogin(ctx, choice, state)
+	if err != nil {
+		failed(err)
+		return
 	}
-	state.set("starting", "正在向 Dify 请求设备授权…")
-	r, err := invoke(ctx, "login", "--server", server, "--no-browser", "--no-wait", "--no-keyring")
+	if reused {
+		return
+	}
+	state.set(stageStarting, msgRequestingDevice)
+	r, err := invoke(ctx, loginArgs(choice)...)
 	if err != nil {
 		failed(err)
 		return
@@ -504,7 +547,7 @@ func runAuthorization(ctx context.Context, choice connectorSettings, state *port
 		interval = 30
 	}
 	state.Lock()
-	state.Stage = "pending"
+	state.Stage = stagePending
 	state.Message = "请在 Dify 授权页面完成确认，本页会自动检测。"
 	state.VerificationURI = uri
 	state.UserCode = code
@@ -572,14 +615,6 @@ func authPortal(ctx context.Context, args []string) error {
 			return err
 		}
 	}
-	sharedDir := saved.SharedConfigDir
-	if sharedDir == "" {
-		sharedDir = detectCLIConfigDir()
-	}
-	sharedLogin := readSavedLogin(sharedDir)
-	if server == "" {
-		server, _ = validateServer(sharedLogin.Server)
-	}
 	dir, err := root()
 	if err != nil {
 		return err
@@ -597,8 +632,8 @@ func authPortal(ctx context.Context, args []string) error {
 	if err != nil {
 		return problem("E-0004", "无法创建本机连接向导，请检查回环端口权限。")
 	}
-	state := &portalState{Stage: "setup", Message: "填写 Dify 控制台地址后发起连接。", Server: server,
-		ShareLogin: saved.SharedConfigDir != "", SharedConfigDir: sharedDir, SharedLogin: sharedLogin.summary()}
+	state := &portalState{Stage: stageSetup, Message: "填写 Dify 控制台地址后发起连接。", Server: server,
+		ShareLogin: saved.SharedConfigDir != "", SharedConfigDir: saved.SharedConfigDir, SharedLogin: readSavedLogin(saved.SharedConfigDir).summary()}
 	nonce := token()
 	endpoint := "/" + token()
 	host := listener.Addr().String()
@@ -632,6 +667,15 @@ func authPortal(ctx context.Context, args []string) error {
 				write(w, 200, "text/html; charset=utf-8", []byte(body))
 			case endpoint + "/state":
 				jsonReply(w, 200, state.snapshot())
+			case endpoint + "/detect":
+				// Runs only when the user ticks sharing or edits the folder: detection
+				// starts their login shell and reads the shared folder's login.
+				info, e := sharedFolderInfo(r.URL.Query().Get("dir"))
+				if e != nil {
+					jsonReply(w, 400, map[string]string{"error": "invalid_config_dir"})
+					return
+				}
+				jsonReply(w, 200, info)
 			default:
 				jsonReply(w, 404, map[string]string{"error": "not_found"})
 			}
@@ -675,8 +719,12 @@ func authPortal(ctx context.Context, args []string) error {
 				return
 			}
 		}
+		if sharedLoginConflicts(choice) {
+			jsonReply(w, 400, map[string]string{"error": "shared_server_mismatch"})
+			return
+		}
 		state.Lock()
-		if state.Stage != "setup" {
+		if state.Stage != stageSetup {
 			state.Unlock()
 			jsonReply(w, 409, map[string]string{"error": "already_started"})
 			return
@@ -688,8 +736,8 @@ func authPortal(ctx context.Context, args []string) error {
 			jsonReply(w, 500, map[string]string{"error": "profile_unavailable"})
 			return
 		}
-		state.Stage = "starting"
-		state.Message = "正在向 Dify 请求设备授权…"
+		state.Stage = stageStarting
+		state.Message = msgRequestingDevice
 		state.Server = target
 		state.ShareLogin = body.ShareLogin
 		state.Unlock()
@@ -729,14 +777,14 @@ func authPortal(ctx context.Context, args []string) error {
 			state.Lock()
 			stage, message, errorCode := state.Stage, state.Message, state.ErrorCode
 			state.Unlock()
-			if stage == "authorized" || stage == "error" {
+			if stage == stageAuthorized || stage == stageError {
 				if finishedAt.IsZero() {
 					finishedAt = time.Now()
 				}
 				if time.Since(finishedAt) < 3*time.Second {
 					continue
 				}
-				if stage == "authorized" {
+				if stage == stageAuthorized {
 					printJSON(map[string]string{"status": "authorized"})
 					return nil
 				}
@@ -747,6 +795,45 @@ func authPortal(ctx context.Context, args []string) error {
 			}
 		}
 	}
+}
+
+// Logout always leaves the connector disconnected until the next Connect: the marker
+// blocks a saved login that could not be revoked, and a later terminal login in a
+// shared folder.
+func authLogout(ctx context.Context) error {
+	dir, err := root()
+	if err != nil {
+		return err
+	}
+	lock, err := os.OpenFile(filepath.Join(dir, "auth.lock"), os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+	if lockFile(lock) != nil {
+		return problem("E-0003", "认证向导仍在运行，请先关闭向导，再退出连接器。")
+	}
+	defer unlockFile(lock)
+	if err = markRequired(); err != nil {
+		return err
+	}
+	r, err := invoke(ctx, "logout")
+	if errors.Is(err, errCLINotInstalled) {
+		printJSON(map[string]string{"status": "unauthorized"})
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	err = success(r)
+	if hasCode(err, "E-0001") {
+		err = nil // nothing was saved to log out
+	}
+	if err != nil {
+		return err
+	}
+	printJSON(map[string]string{"status": "unauthorized"})
+	return nil
 }
 func mainRun(args []string) error {
 	if len(args) == 1 && args[0] == "--version" {
@@ -762,29 +849,7 @@ func mainRun(args []string) error {
 		return authPortal(ctx, args[2:])
 	}
 	if len(args) == 2 && args[0] == "auth" && args[1] == "logout" {
-		dir, err := root()
-		if err != nil {
-			return err
-		}
-		lock, err := os.OpenFile(filepath.Join(dir, "auth.lock"), os.O_CREATE|os.O_RDWR, 0600)
-		if err != nil {
-			return err
-		}
-		defer lock.Close()
-		if lockFile(lock) != nil {
-			return problem("E-0003", "认证向导仍在运行，请先关闭向导，再退出连接器。")
-		}
-		defer unlockFile(lock)
-		r, err := invoke(ctx, "logout")
-		if err == nil {
-			err = success(r)
-		}
-		// No installed CLI or no saved login: there is nothing to log out.
-		if err != nil && !hasCode(err, "E-0001") {
-			return err
-		}
-		printJSON(map[string]string{"status": "unauthorized"})
-		return nil
+		return authLogout(ctx)
 	}
 	if len(args) == 2 && args[0] == "identity" && args[1] == "whoami" {
 		data, err := account(ctx, true)

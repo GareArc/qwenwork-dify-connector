@@ -64,6 +64,10 @@ func cachedOfficialPath() (string, upstreamAsset, error) {
 	return filepath.Join(dir, "runtime", catalog.Version, runtime.GOOS+"_"+runtime.GOARCH, officialFilename()), asset, nil
 }
 
+// The client sees E-0001 (status reports unauthorized), but callers can tell it apart
+// from "not logged in": without the CLI nothing can check or end a saved login.
+var errCLINotInstalled = &adapterError{"E-0001", "官方 difyctl 尚未安装，请在连接器页面点击认证。"}
+
 // Status, identity and logout must answer without the network, so they only use a
 // CLI that is already installed. Only Connect and business calls download it.
 func installedOfficialCLI() (string, error) {
@@ -71,10 +75,25 @@ func installedOfficialCLI() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if !receiptValid(path, asset) {
-		return "", problem("E-0001", "官方 difyctl 尚未安装，请在连接器页面点击认证。")
+	if receiptValid(path, asset) {
+		return path, nil
+	}
+	// A complete binary whose receipt went stale (a crash, a restore, antivirus) is
+	// re-hashed locally instead of being treated as missing.
+	if verifyOfficial(path, asset) != nil {
+		return "", errCLINotInstalled
+	}
+	if err = adoptVerified(path, asset); err != nil {
+		return "", err
 	}
 	return path, nil
+}
+
+func adoptVerified(path string, asset upstreamAsset) error {
+	if err := os.Chmod(path, 0700); err != nil {
+		return err
+	}
+	return writeReceipt(path, asset)
 }
 
 type downloadProgress func(done, total int64)
@@ -252,13 +271,10 @@ func ensureOfficialCLI(ctx context.Context, progress downloadProgress) (string, 
 		return path, nil
 	}
 	if verifyOfficial(path, asset) == nil {
-		if err = os.Chmod(path, 0700); err == nil {
-			err = writeReceipt(path, asset)
+		if err = adoptVerified(path, asset); err != nil {
+			return "", problem("E-0004", "无法准备本机官方 CLI 缓存，请检查文件权限。")
 		}
-		if err == nil {
-			return path, nil
-		}
-		return "", problem("E-0004", "无法准备本机官方 CLI 缓存，请检查文件权限。")
+		return path, nil
 	}
 	if info, statErr := os.Lstat(path); statErr == nil && !info.Mode().IsRegular() {
 		return "", problem("E-0004", "官方 CLI 缓存不是普通文件，请重新安装连接器。")

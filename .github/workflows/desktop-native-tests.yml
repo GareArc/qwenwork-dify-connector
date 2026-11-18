@@ -123,7 +123,7 @@ jobs:
 
   release:
     name: Publish GitHub pre-release
-    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.publish)
+    if: (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && inputs.publish)
     needs: package
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -148,7 +148,15 @@ jobs:
               echo "Manual releases run from main only, not $GITHUB_REF" >&2
               exit 1
             fi
-            if existing=$(gh api "repos/$GITHUB_REPOSITORY/commits/$tag" -q .sha 2>/dev/null); then
+            # matching-refs answers 200 with an empty list for a missing tag, so any
+            # API failure stops the job instead of passing for "no such tag".
+            ref=$(gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/$tag" \
+              --jq ".[] | select(.ref == \"refs/tags/$tag\") | .object | .type + \" \" + .sha")
+            if [ -n "$ref" ]; then
+              existing=${ref#* }
+              if [ "${ref%% *}" = "tag" ]; then
+                existing=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$existing" --jq .object.sha)
+              fi
               if [ "$existing" != "$GITHUB_SHA" ]; then
                 echo "Tag $tag already points at $existing; bump the connector version first" >&2
                 exit 1

@@ -53,36 +53,44 @@ func openBrowser(address string) error {
 
 func executableName(name string) string { return name }
 
-const shellEnvMarker = "__DIFY_QWEN_ENV__"
+const (
+	shellEnvMarker  = "__DIFY_QWEN_ENV__"
+	shellEnvEnd     = shellEnvMarker + "END"
+	shellEnvTimeout = 3 * time.Second
+)
 
-// Reads variables as the user's terminal sees them. Interactive login shells can
-// print banners, so the values follow a marker, one per line.
+// Reads variables as the user's terminal sees them. Each value follows its own
+// marker, so banners, values with newlines and logout scripts can't shift them.
+// The end marker proves the values printed completely; then the output is used
+// even if the shell later fails or is stopped by the timeout.
 func loginShellEnv(names ...string) map[string]string {
 	shell := os.Getenv("SHELL")
 	if shell == "" {
 		return nil
 	}
-	script := "printf '" + shellEnvMarker + "\\n'"
+	script := ""
 	for _, name := range names {
-		script += "; printf '%s\\n' \"$" + name + "\""
+		script += "printf '\\n" + shellEnvMarker + name + "='; printf '%s' \"$" + name + "\"; "
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	script += "printf '\\n" + shellEnvEnd + "\\n'"
+	ctx, cancel := context.WithTimeout(context.Background(), shellEnvTimeout)
 	defer cancel()
 	command := exec.CommandContext(ctx, shell, "-ilc", script)
 	command.WaitDelay = time.Second
-	out, err := command.Output()
-	if err != nil {
+	out, _ := command.Output()
+	printed, _, complete := strings.Cut(string(out), "\n"+shellEnvEnd)
+	if !complete {
 		return nil
 	}
-	at := strings.LastIndex(string(out), shellEnvMarker+"\n")
-	if at < 0 {
-		return nil
+	wanted := map[string]bool{}
+	for _, name := range names {
+		wanted[name] = true
 	}
-	values := strings.Split(string(out[at+len(shellEnvMarker)+1:]), "\n")
 	env := map[string]string{}
-	for i, name := range names {
-		if i < len(values) {
-			env[name] = values[i]
+	for _, segment := range strings.Split(printed, "\n"+shellEnvMarker)[1:] {
+		name, value, found := strings.Cut(segment, "=")
+		if found && wanted[name] {
+			env[name] = value
 		}
 	}
 	return env
