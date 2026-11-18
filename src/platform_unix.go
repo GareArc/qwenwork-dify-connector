@@ -3,11 +3,13 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -50,3 +52,55 @@ func openBrowser(address string) error {
 }
 
 func executableName(name string) string { return name }
+
+const shellEnvMarker = "__DIFY_QWEN_ENV__"
+
+// Reads variables as the user's terminal sees them. Interactive login shells can
+// print banners, so the values follow a marker, one per line.
+func loginShellEnv(names ...string) map[string]string {
+	shell := os.Getenv("SHELL")
+	if shell == "" {
+		return nil
+	}
+	script := "printf '" + shellEnvMarker + "\\n'"
+	for _, name := range names {
+		script += "; printf '%s\\n' \"$" + name + "\""
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	command := exec.CommandContext(ctx, shell, "-ilc", script)
+	command.WaitDelay = time.Second
+	out, err := command.Output()
+	if err != nil {
+		return nil
+	}
+	at := strings.LastIndex(string(out), shellEnvMarker+"\n")
+	if at < 0 {
+		return nil
+	}
+	values := strings.Split(string(out[at+len(shellEnvMarker)+1:]), "\n")
+	env := map[string]string{}
+	for i, name := range names {
+		if i < len(values) {
+			env[name] = values[i]
+		}
+	}
+	return env
+}
+
+func defaultCLIConfigDir(shellXDG string) string {
+	if runtime.GOOS == "linux" {
+		xdg := shellXDG
+		if xdg == "" {
+			xdg = os.Getenv(envXDGConfigHome)
+		}
+		if xdg != "" {
+			return filepath.Join(xdg, "difyctl")
+		}
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".config", "difyctl")
+}

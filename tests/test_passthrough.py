@@ -136,6 +136,24 @@ class NativeAdapterTests(unittest.TestCase):
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertEqual(p.stdout.strip(), EXPECTED_VERSION.encode())
 
+    def test_lifecycle_commands_never_download_the_official_cli(self):
+        # A profile left by an earlier connector version, with GitHub unreachable.
+        self.vendor.unlink()
+        (self.profile / "difyctl").mkdir(parents=True)
+        for key in ("NO_PROXY", "no_proxy"):
+            self.env.pop(key, None)
+        self.env.update(HTTPS_PROXY="http://127.0.0.1:9", HTTP_PROXY="http://127.0.0.1:9")
+        status = self.run_adapter(["auth", "show", "--status"])
+        self.assertEqual(status.returncode, 0, status.stderr)
+        self.assertEqual(json.loads(status.stdout), {"status": "unauthorized"})
+        whoami = self.run_adapter(["identity", "whoami"])
+        self.assertEqual(whoami.returncode, 1)
+        self.assertEqual(json.loads(whoami.stderr)["code"], "E-0001")
+        logout = self.run_adapter(["auth", "logout"])
+        self.assertEqual(logout.returncode, 0, logout.stderr)
+        self.assertEqual(json.loads(logout.stdout), {"status": "unauthorized"})
+        self.assertFalse((self.profile / "runtime").exists(), "Lifecycle commands must not start a download")
+
     def test_direct_and_legacy_cli_arguments_are_unchanged(self):
         args = ["example.with.dot", "--argument", "合同 a'b $(echo x)\n", "--literal", '%PATH% ! & | ^ < > "quoted"', "--windows-path", "C:\\folder with spaces\\", "--json"]
         for prefix in ([], ["cli"]):
@@ -358,6 +376,33 @@ class NativeAdapterTests(unittest.TestCase):
         self.assertIsNotNone(p.returncode, "Closing portal must release the waiting client")
         calls = (self.root / "mock-calls.jsonl").read_text()
         self.assertNotIn("--resume", calls, "Closing before the first poll must cancel polling")
+
+    def test_portal_shares_the_local_cli_login(self):
+        local = self.root / "local-difyctl"
+        local.mkdir()
+        (local / "login.yml").write_text("server: https://dify.example.invalid\nemail: user@example.invalid\n"
+                                         "account:\n  email: nested@example.invalid\n")
+        self.env["DIFY_CONFIG_DIR"] = str(local)
+        p, base, _, headers = self.start_portal()
+        state = json.load(self.portal_request(base + "/state"))
+        self.assertEqual(state["shared_config_dir"], str(local))
+        self.assertEqual(state["shared_login"], "user@example.invalid · https://dify.example.invalid")
+        self.assertEqual(state["server"], "https://dify.example.invalid")
+        self.assertFalse(state["share_login"], "Sharing is opt-in")
+        relative = json.dumps({"server": "https://dify.example.invalid", "share_login": True, "shared_config_dir": "relative/dir"}).encode()
+        with self.assertRaises(urllib.error.HTTPError) as e:
+            self.portal_request(base + "/start", data=relative, headers=headers)
+        self.assertEqual(e.exception.code, 400)
+        body = json.dumps({"server": "https://dify.example.invalid", "share_login": True, "shared_config_dir": str(local)}).encode()
+        self.portal_request(base + "/start", data=body, headers=headers).close()
+        state = self.wait_stage(base, {"authorized", "error", "pending"})
+        self.assertEqual(state["stage"], "authorized", state)
+        self.assertEqual(state["identity"]["id"], "mock-user")
+        self.assertNotIn("--no-wait", (self.root / "mock-calls.jsonl").read_text(), "A working shared login needs no new device login")
+        p.communicate(timeout=10)
+        self.assertEqual(p.returncode, 0)
+        business = self.run_adapter(["get", "workspace", "--json"])
+        self.assertEqual(json.loads(business.stdout)["env"]["DIFY_CONFIG_DIR"], str(local))
 
     def test_portal_rejects_cross_origin_verification_url(self):
         p, base, _, headers = self.start_portal(verification_uri="https://attacker.invalid/activate")
